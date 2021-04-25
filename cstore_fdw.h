@@ -26,6 +26,7 @@
 /* Defines for valid option names */
 #define OPTION_NAME_FILENAME "filename"
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
+#define OPTION_NAME_COMPRESSION_LEVEL "compression_level"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_count"
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
 
@@ -43,7 +44,10 @@
 /* String representations of compression types */
 #define COMPRESSION_STRING_NONE "none"
 #define COMPRESSION_STRING_PG_LZ "pglz"
-#define COMPRESSION_STRING_DELIMITED_LIST "none, pglz"
+#define COMPRESSION_STRING_LZ4 "lz4"
+#define COMPRESSION_STRING_ZSTD "zstd"
+
+#define COMPRESSION_STRING_DELIMITED_LIST "none, pglz, lz4, zstd"
 
 /* CStore file signature */
 #define CSTORE_MAGIC_NUMBER "citus_cstore"
@@ -88,6 +92,7 @@ static const CStoreValidOption ValidOptionArray[] =
 	/* foreign table options */
 	{ OPTION_NAME_FILENAME, ForeignTableRelationId },
 	{ OPTION_NAME_COMPRESSION_TYPE, ForeignTableRelationId },
+	{ OPTION_NAME_COMPRESSION_LEVEL, ForeignTableRelationId },
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
 	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId }
 };
@@ -99,6 +104,8 @@ typedef enum
 	COMPRESSION_TYPE_INVALID = -1,
 	COMPRESSION_NONE = 0,
 	COMPRESSION_PG_LZ = 1,
+	COMPRESSION_LZ4 = 2,
+	COMPRESSION_ZSTD = 3,
 
 	COMPRESSION_COUNT
 
@@ -114,6 +121,7 @@ typedef struct CStoreFdwOptions
 {
 	char *filename;
 	CompressionType compressionType;
+	int compressionLevel;
 	uint64 stripeRowCount;
 	uint32 blockRowCount;
 
@@ -283,6 +291,7 @@ typedef struct TableWriteState
 	TableFooter *tableFooter;
 	StringInfo tableFooterFilename;
 	CompressionType compressionType;
+	int32 compressionLevel;
 	TupleDesc tupleDescriptor;
 	FmgrInfo **comparisonFunctionArray;
 	uint64 currentFileOffset;
@@ -321,6 +330,7 @@ extern Datum cstore_fdw_validator(PG_FUNCTION_ARGS);
 /* Function declarations for writing to a cstore file */
 extern TableWriteState * CStoreBeginWrite(const char *filename,
 										  CompressionType compressionType,
+										  int32 compressionLevel,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
 										  TupleDesc tupleDescriptor);
@@ -345,8 +355,8 @@ extern ColumnBlockData ** CreateEmptyBlockDataArray(uint32 columnCount, bool *co
 extern void FreeColumnBlockDataArray(ColumnBlockData **blockDataArray,
 									 uint32 columnCount);
 extern uint64 CStoreTableRowCount(const char *filename);
-extern bool CompressBuffer(StringInfo inputBuffer, StringInfo outputBuffer,
-						   CompressionType compressionType);
+extern CompressionType CompressBuffer(StringInfo inputBuffer, StringInfo outputBuffer,
+						   CompressionType compressionType, int compressionLevel);
 extern StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType);
 
 

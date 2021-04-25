@@ -74,6 +74,14 @@
 
 #include "cstore_version_compat.h"
 
+#ifdef ENABLE_LZ4
+#include <lz4hc.h>
+#endif
+
+#ifdef ENABLE_ZSTD
+#include <zstd.h>
+#endif
+
 
 /* local functions forward declarations */
 #if PG_VERSION_NUM >= 130000
@@ -120,7 +128,8 @@ static StringInfo OptionNamesString(Oid currentContextId);
 static HeapTuple GetSlotHeapTuple(TupleTableSlot *tts);
 static CStoreFdwOptions * CStoreGetOptions(Oid foreignTableId);
 static char * CStoreGetOptionValue(Oid foreignTableId, const char *optionName);
-static void ValidateForeignTableOptions(char *filename, char *compressionTypeString,
+static void ValidateForeignTableOptions(char *filename,
+										char *compressionTypeString, char* compressionLevelString,
 										char *stripeRowCountString,
 										char *blockRowCountString);
 static char * CStoreDefaultFilePath(Oid foreignTableId);
@@ -606,6 +615,7 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 	/* init state to write to the cstore file */
 	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
 								  cstoreFdwOptions->compressionType,
+								  cstoreFdwOptions->compressionLevel,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
 								  tupleDescriptor);
@@ -942,7 +952,8 @@ static void InitializeCStoreTableFile(Oid relationId, Relation relation)
 	 * empty data file and a valid footer file for the table.
 	 */
 	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
-			cstoreFdwOptions->compressionType, cstoreFdwOptions->stripeRowCount,
+			cstoreFdwOptions->compressionType, cstoreFdwOptions->compressionLevel,
+			cstoreFdwOptions->stripeRowCount,
 			cstoreFdwOptions->blockRowCount, tupleDescriptor);
 	CStoreEndWrite(writeState);
 }
@@ -1279,6 +1290,7 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	ListCell *optionCell = NULL;
 	char *filename = NULL;
 	char *compressionTypeString = NULL;
+	char *compressionLevelString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
 
@@ -1320,6 +1332,10 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			compressionTypeString = defGetString(optionDef);
 		}
+		else if (strncmp(optionName, OPTION_NAME_COMPRESSION_LEVEL, NAMEDATALEN) == 0)
+		{
+			compressionLevelString = defGetString(optionDef);
+		}
 		else if (strncmp(optionName, OPTION_NAME_STRIPE_ROW_COUNT, NAMEDATALEN) == 0)
 		{
 			stripeRowCountString = defGetString(optionDef);
@@ -1332,7 +1348,7 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 
 	if (optionContextId == ForeignTableRelationId)
 	{
-		ValidateForeignTableOptions(filename, compressionTypeString,
+		ValidateForeignTableOptions(filename, compressionTypeString, compressionLevelString,
 									stripeRowCountString, blockRowCountString);
 	}
 
@@ -1432,27 +1448,35 @@ CStoreGetOptions(Oid foreignTableId)
 	CStoreFdwOptions *cstoreFdwOptions = NULL;
 	char *filename = NULL;
 	CompressionType compressionType = DEFAULT_COMPRESSION_TYPE;
+	int32 compressionLevel = 0;
 	int32 stripeRowCount = DEFAULT_STRIPE_ROW_COUNT;
 	int32 blockRowCount = DEFAULT_BLOCK_ROW_COUNT;
 	char *compressionTypeString = NULL;
+	char *compressionLevelString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
 
 	filename = CStoreGetOptionValue(foreignTableId, OPTION_NAME_FILENAME);
 	compressionTypeString = CStoreGetOptionValue(foreignTableId,
 												 OPTION_NAME_COMPRESSION_TYPE);
+	compressionLevelString = CStoreGetOptionValue(foreignTableId,
+												 OPTION_NAME_COMPRESSION_LEVEL);
 	stripeRowCountString = CStoreGetOptionValue(foreignTableId,
 												OPTION_NAME_STRIPE_ROW_COUNT);
 	blockRowCountString = CStoreGetOptionValue(foreignTableId,
 											   OPTION_NAME_BLOCK_ROW_COUNT);
 
-	ValidateForeignTableOptions(filename, compressionTypeString,
+	ValidateForeignTableOptions(filename, compressionTypeString, compressionLevelString,
 								stripeRowCountString, blockRowCountString);
 
 	/* parse provided options */
 	if (compressionTypeString != NULL)
 	{
 		compressionType = ParseCompressionType(compressionTypeString);
+	}
+	if (compressionLevelString != NULL)
+	{
+		compressionLevel = pg_atoi(compressionLevelString, sizeof(int32), 0);
 	}
 	if (stripeRowCountString != NULL)
 	{
@@ -1472,6 +1496,7 @@ CStoreGetOptions(Oid foreignTableId)
 	cstoreFdwOptions = palloc0(sizeof(CStoreFdwOptions));
 	cstoreFdwOptions->filename = filename;
 	cstoreFdwOptions->compressionType = compressionType;
+	cstoreFdwOptions->compressionLevel = compressionLevel;
 	cstoreFdwOptions->stripeRowCount = stripeRowCount;
 	cstoreFdwOptions->blockRowCount = blockRowCount;
 
@@ -1521,7 +1546,7 @@ CStoreGetOptionValue(Oid foreignTableId, const char *optionName)
  * considered invalid.
  */
 static void
-ValidateForeignTableOptions(char *filename, char *compressionTypeString,
+ValidateForeignTableOptions(char *filename, char *compressionTypeString, char *compressionLevelString,
 							char *stripeRowCountString, char *blockRowCountString)
 {
 	/* we currently do not have any checks for filename */
@@ -1537,21 +1562,35 @@ ValidateForeignTableOptions(char *filename, char *compressionTypeString,
 							errhint("Valid options are: %s",
 									COMPRESSION_STRING_DELIMITED_LIST)));
 		}
-	}
 
-	/* check if the provided stripe row count has correct format and range */
-	if (stripeRowCountString != NULL)
-	{
-		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
-		int32 stripeRowCount = pg_atoi(stripeRowCountString, sizeof(int32), 0);
-		if (stripeRowCount < STRIPE_ROW_COUNT_MINIMUM ||
-			stripeRowCount > STRIPE_ROW_COUNT_MAXIMUM)
+#ifdef ENABLE_LZ4
+		/* check if the provided compression level is valid for the compression algorithm*/
+		if (compressionType == COMPRESSION_LZ4 && compressionLevelString != NULL)
 		{
-			ereport(ERROR, (errmsg("invalid stripe row count"),
-							errhint("Stripe row count must be an integer between "
-									"%d and %d", STRIPE_ROW_COUNT_MINIMUM,
-									STRIPE_ROW_COUNT_MAXIMUM)));
+			int32 compressionLevel = pg_atoi(compressionLevelString, sizeof(int32), 0);
+			if (compressionLevel<0 || compressionLevel>LZ4HC_CLEVEL_MAX)
+			{
+				ereport(ERROR, (errmsg("invalid compression level"),
+								errhint("Valid compression levels are: 0(lz4) and 1..%d(lz4hc)",
+										LZ4HC_CLEVEL_MAX)));
+			}
 		}
+#endif
+
+#ifdef ENABLE_ZSTD
+		/* check if the provided compression level is valid for the zstd compression algorithm*/
+		if (compressionType == COMPRESSION_ZSTD && compressionLevelString != NULL)
+		{
+			int32 compressionLevel = pg_atoi(compressionLevelString, sizeof(int32), 0);
+			if (compressionLevel<ZSTD_minCLevel() || compressionLevel>ZSTD_maxCLevel())
+			{
+				ereport(ERROR, (errmsg("invalid compression level"),
+								errhint("Valid zstd compression levels are: %d..%d",
+										ZSTD_minCLevel(), ZSTD_maxCLevel() )));
+			}
+		}
+#endif
+
 	}
 
 	/* check if the provided block row count has correct format and range */
@@ -1616,6 +1655,18 @@ ParseCompressionType(const char *compressionTypeString)
 	{
 		compressionType = COMPRESSION_PG_LZ;
 	}
+#ifdef ENABLE_LZ4
+	else if (strncmp(compressionTypeString, COMPRESSION_STRING_LZ4, NAMEDATALEN) == 0)
+	{
+		compressionType = COMPRESSION_LZ4;
+	}
+#endif
+#ifdef ENABLE_ZSTD
+	else if (strncmp(compressionTypeString, COMPRESSION_STRING_ZSTD, NAMEDATALEN) == 0)
+	{
+		compressionType = COMPRESSION_ZSTD;
+	}
+#endif
 
 	return compressionType;
 }
@@ -2347,6 +2398,7 @@ CStoreBeginForeignInsert(ModifyTableState *modifyTableState, ResultRelInfo *rela
 
 	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
 								  cstoreFdwOptions->compressionType,
+								  cstoreFdwOptions->compressionLevel,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
 								  tupleDescriptor);

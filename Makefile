@@ -34,6 +34,42 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 #
+# LZ4 compression can be enabled by passing enable_lz4=yes on the commandline
+# additionaly the path to the lz4 folder can be supplied using the lz4_path variable
+#
+
+ifneq (,$(wildcard ../lz4/lib/liblz4.a))
+	enable_lz4=yes
+	lz4_path=../lz4
+endif
+ifeq ($(enable_lz4),yes)
+	PG_CPPFLAGS += -DENABLE_LZ4
+        SHLIB_LINK += -llz4
+endif
+ifneq ($(lz4_path),)
+	PG_CPPFLAGS += -I$(lz4_path)/lib
+        SHLIB_LINK += -L$(lz4_path)/lib
+endif
+
+#
+# ZSTD compression can be enabled by passing enable_zstd=yes on the commandline
+# additionaly the path to the zstd folder can be supplied using the zstd_path variable
+#
+
+ifneq (,$(wildcard ../zstd/lib/libzstd.a))
+	enable_zstd=yes
+	zstd_path=../zstd
+endif
+ifeq ($(enable_zstd),yes)
+	PG_CPPFLAGS += -DENABLE_ZSTD
+        SHLIB_LINK += -lzstd
+endif
+ifneq ($(zstd_path),)
+	PG_CPPFLAGS += -I$(zstd_path)/lib
+        SHLIB_LINK += -L$(zstd_path)/lib
+endif
+
+#
 # Users need to specify their Postgres installation path through pg_config. For
 # example: /usr/local/pgsql/bin/pg_config or /usr/lib/postgresql/9.3/bin/pg_config
 #

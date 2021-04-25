@@ -93,7 +93,10 @@ The following parameters can be set on a cstore foreign table object.
   the files ```/cstore_fdw/my_table``` and ```/cstore_fdw/my_table.footer``` being used
   to manage table data.
 * compression (optional): The compression used for compressing value streams.
-  Valid options are ```none``` and ```pglz```. The default is ```none```.
+  Valid options are ```none```, ```pglz```, ```lz4``` and ```zstd```.
+  The default is ```none```.
+* compression_level (optional): for lz4 use ```0```, levels >= 1 for lz4hc.
+  The default is ```0``` for lz4 and ```1``` for zstd.
 * stripe\_row\_count (optional): Number of rows per stripe. The default is
   ```150000```. Reducing this decreases the amount memory used for loading data
   and querying, but also decreases the performance.

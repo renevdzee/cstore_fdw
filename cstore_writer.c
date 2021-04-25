@@ -74,6 +74,7 @@ static StringInfo CopyStringInfo(StringInfo sourceString);
  */
 TableWriteState *
 CStoreBeginWrite(const char *filename, CompressionType compressionType,
+				 int32 compressionLevel,
 				 uint64 stripeMaxRowCount, uint32 blockRowCount,
 				 TupleDesc tupleDescriptor)
 {
@@ -185,6 +186,7 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 	writeState->tableFooterFilename = tableFooterFilename;
 	writeState->tableFooter = tableFooter;
 	writeState->compressionType = compressionType;
+	writeState->compressionLevel = compressionLevel;
 	writeState->stripeMaxRowCount = stripeMaxRowCount;
 	writeState->tupleDescriptor = tupleDescriptor;
 	writeState->currentFileOffset = currentFileOffset;
@@ -771,6 +773,7 @@ SerializeBlockData(TableWriteState *writeState, uint32 blockIndex, uint32 rowCou
 	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
 	ColumnBlockData **blockDataArray = writeState->blockDataArray;
 	CompressionType requestedCompressionType = writeState->compressionType;
+	int32 requestedCompressionLevel = writeState->compressionLevel;
 	const uint32 columnCount = stripeBuffers->columnCount;
 	StringInfo compressionBuffer = writeState->compressionBuffer;
 
@@ -795,24 +798,19 @@ SerializeBlockData(TableWriteState *writeState, uint32 blockIndex, uint32 rowCou
 		ColumnBlockData *blockData = blockDataArray[columnIndex];
 		StringInfo serializedValueBuffer = NULL;
 		CompressionType actualCompressionType = COMPRESSION_NONE;
-		bool compressed = false;
 
 		serializedValueBuffer = blockData->valueBuffer;
-
-		/* the only other supported compression type is pg_lz for now */
-		Assert(requestedCompressionType == COMPRESSION_NONE ||
-			   requestedCompressionType == COMPRESSION_PG_LZ);
 
 		/*
 		 * if serializedValueBuffer is be compressed, update serializedValueBuffer
 		 * with compressed data and store compression type.
 		 */
-		compressed = CompressBuffer(serializedValueBuffer, compressionBuffer,
-									requestedCompressionType);
-		if (compressed)
+		actualCompressionType = CompressBuffer(serializedValueBuffer, compressionBuffer,
+												requestedCompressionType, requestedCompressionLevel);
+		if (actualCompressionType != COMPRESSION_NONE)
 		{
 			serializedValueBuffer = compressionBuffer;
-			actualCompressionType = COMPRESSION_PG_LZ;
+			actualCompressionType = requestedCompressionType;
 		}
 
 		/* store (compressed) value buffer */

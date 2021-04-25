@@ -6,6 +6,8 @@ enum CompressionType {
   // Values should match with the corresponding struct in cstore_fdw.h
   NONE = 0;
   PG_LZ = 1;
+  LZ4 = 2;
+  ZSTD = 3;
 };
 
 message ColumnBlockSkipNode {
