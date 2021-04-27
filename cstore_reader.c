@@ -44,7 +44,8 @@ static StripeBuffers * LoadFilteredStripeBuffers(FILE *tableFile,
 												 StripeMetadata *stripeMetadata,
 												 TupleDesc tupleDescriptor,
 												 List *projectedColumnList,
-												 List *whereClauseList);
+												 List *whereClauseList,
+												 List *whereClauseVars);
 static void ReadStripeNextRow(StripeBuffers *stripeBuffers, List *projectedColumnList,
 							  uint64 blockIndex, uint64 blockRowIndex,
 							  ColumnBlockData **blockDataArray,
@@ -91,6 +92,61 @@ static void ResetUncompressedBlockData(ColumnBlockData **blockDataArray,
 									   uint32 columnCount);
 static uint64 StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata);
 
+
+/*
+ * GetClauseVars extracts the Vars from the given clauses for the purpose of
+ * building constraints that can be refuted by predicate_refuted_by(). It also
+ * deduplicates and sorts them.
+ */
+static List *
+GetClauseVars(List *whereClauseList, int natts)
+{
+	/*
+	 * We don't recurse into or include aggregates, window functions, or
+	 * PHVs. We don't expect any PHVs during execution; and Vars found inside
+	 * an aggregate or window function aren't going to be useful in forming
+	 * constraints that can be refuted.
+	 */
+	int flags = 0;
+	List *vars = pull_var_clause((Node *) whereClauseList, flags);
+	Var **deduplicate = palloc0(sizeof(Var *) * natts);
+	List *whereClauseVars;
+
+	ListCell *lc;
+	foreach(lc, vars)
+	{
+		Node *node = lfirst(lc);
+		Var *var;
+		int idx;
+
+		Assert(IsA(node, Var));
+
+		var = (Var *) node;
+		idx = var->varattno - 1;
+
+		if (deduplicate[idx] != NULL)
+		{
+			/* if they have the same varattno, the rest should be identical */
+			Assert(equal(var, deduplicate[idx]));
+		}
+
+		deduplicate[idx] = var;
+	}
+
+	whereClauseVars = NIL;
+	for (int i = 0; i < natts; i++)
+	{
+		Var *var = deduplicate[i];
+		if (var != NULL)
+		{
+			whereClauseVars = lappend(whereClauseVars, var);
+		}
+	}
+
+	pfree(deduplicate);
+
+	return whereClauseVars;
+}
 
 /*
  * CStoreBeginRead initializes a cstore read operation. This function returns a
@@ -143,6 +199,7 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	readState->tableFooter = tableFooter;
 	readState->projectedColumnList = projectedColumnList;
 	readState->whereClauseList = whereClauseList;
+	readState->whereClauseVars = GetClauseVars(whereClauseList, columnCount);
 	readState->stripeBuffers = NULL;
 	readState->readStripeCount = 0;
 	readState->stripeReadRowCount = 0;
@@ -264,7 +321,8 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		stripeBuffers = LoadFilteredStripeBuffers(readState->tableFile, stripeMetadata,
 												  readState->tupleDescriptor,
 												  readState->projectedColumnList,
-												  readState->whereClauseList);
+												  readState->whereClauseList,
+												  readState->whereClauseVars);
 		readState->readStripeCount++;
 
 		MemoryContextSwitchTo(oldContext);
@@ -470,7 +528,7 @@ StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata)
 static StripeBuffers *
 LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
-						  List *whereClauseList)
+						  List *whereClauseList, List *whereClauseVars)
 {
 	StripeBuffers *stripeBuffers = NULL;
 	ColumnBuffers **columnBuffersArray = NULL;
@@ -487,7 +545,7 @@ LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 														projectedColumnMask,
 														tupleDescriptor);
 
-	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, projectedColumnList,
+	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, whereClauseVars,
 												whereClauseList);
 
 	StripeSkipList *selectedBlockSkipList =
@@ -742,7 +800,7 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
  * the block can be refuted by the given qualifier conditions.
  */
 static bool *
-SelectedBlockMask(StripeSkipList *stripeSkipList, List *projectedColumnList,
+SelectedBlockMask(StripeSkipList *stripeSkipList, List *whereClauseVars,
 				  List *whereClauseList)
 {
 	bool *selectedBlockMask = NULL;
@@ -753,29 +811,28 @@ SelectedBlockMask(StripeSkipList *stripeSkipList, List *projectedColumnList,
 	selectedBlockMask = palloc0(stripeSkipList->blockCount * sizeof(bool));
 	memset(selectedBlockMask, true, stripeSkipList->blockCount * sizeof(bool));
 
-	foreach(columnCell, projectedColumnList)
+	for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
 	{
-		Var *column = lfirst(columnCell);
-		uint32 columnIndex = column->varattno - 1;
-		FmgrInfo *comparisonFunction = NULL;
-		Node *baseConstraint = NULL;
+		bool predicateRefuted = false;
+		List *constraintList = NIL;
 
-		/* if this column's data type doesn't have a comparator, skip it */
-		comparisonFunction = GetFunctionInfoOrNull(column->vartype, BTREE_AM_OID,
-												   BTORDER_PROC);
-		if (comparisonFunction == NULL)
+		foreach(columnCell, whereClauseVars)
 		{
-			continue;
-		}
-
-		baseConstraint = BuildBaseConstraint(column);
-		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
-		{
-			bool predicateRefuted = false;
-			List *constraintList = NIL;
+			Var *column = lfirst(columnCell);
+			uint32 columnIndex = column->varattno - 1;
+			FmgrInfo *comparisonFunction = NULL;
+			Node *baseConstraint = NULL;
 			ColumnBlockSkipNode *blockSkipNodeArray =
 				stripeSkipList->blockSkipNodeArray[columnIndex];
 			ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
+
+			/* if this column's data type doesn't have a comparator, skip it */
+			comparisonFunction = GetFunctionInfoOrNull(column->vartype, BTREE_AM_OID,
+													BTORDER_PROC);
+			if (comparisonFunction == NULL)
+			{
+				continue;
+			}
 
 			/*
 			 * A column block with comparable data type can miss min/max values
@@ -786,19 +843,21 @@ SelectedBlockMask(StripeSkipList *stripeSkipList, List *projectedColumnList,
 				continue;
 			}
 
+			baseConstraint = BuildBaseConstraint(column);
 			UpdateConstraint(baseConstraint, blockSkipNode->minimumValue,
-							 blockSkipNode->maximumValue);
+								blockSkipNode->maximumValue);
 
-			constraintList = list_make1(baseConstraint);
+			constraintList = lappend(constraintList, baseConstraint);
+		}
+
 #if (PG_VERSION_NUM >= 100000)
-			predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList, false);
+		predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList, false);
 #else
-			predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList);
+		predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList);
 #endif
-			if (predicateRefuted)
-			{
-				selectedBlockMask[blockIndex] = false;
-			}
+		if (predicateRefuted)
+		{
+			selectedBlockMask[blockIndex] = false;
 		}
 	}
 

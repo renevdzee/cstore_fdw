@@ -274,6 +274,7 @@ typedef struct TableReadState
 	List *projectedColumnList;
 
 	List *whereClauseList;
+	List *whereClauseVars;
 	MemoryContext stripeReadContext;
 	StripeBuffers *stripeBuffers;
 	uint32 readStripeCount;
