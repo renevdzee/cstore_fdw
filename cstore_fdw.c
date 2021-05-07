@@ -1372,8 +1372,8 @@ cstore_clean_table_resources(PG_FUNCTION_ARGS)
 	struct stat fileStat;
 	int statResult = -1;
 
-	appendStringInfo(filePath, "%s/%s/%d/%d", DataDir, CSTORE_FDW_NAME,
-					 (int) MyDatabaseId, (int) relationId);
+	appendStringInfo(filePath, "%s/%s/%u/%u", DataDir, CSTORE_FDW_NAME,
+					 MyDatabaseId, relationId);
 
 	/*
 	 * Check to see if the file exist first. This is the only way to
