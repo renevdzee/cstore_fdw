@@ -86,7 +86,7 @@ typedef struct CStoreValidOption
 
 
 /* Array of options that are valid for cstore_fdw */
-static const uint32 ValidOptionCount = 4;
+static const uint32 ValidOptionCount = 5;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
