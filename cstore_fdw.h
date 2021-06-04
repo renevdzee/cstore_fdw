@@ -29,6 +29,7 @@
 #define OPTION_NAME_COMPRESSION_LEVEL "compression_level"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_count"
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
+#define OPTION_NAME_BLOOMFILTER "bloomfilter"
 
 /* Default values for option parameters */
 #define DEFAULT_COMPRESSION_TYPE COMPRESSION_NONE
@@ -71,6 +72,8 @@
 #define ATTR_NUM_PARTITION_TYPE 2
 #define ATTR_NUM_PARTITION_KEY 3
 
+/* default value for bloomfilter */
+#define BLOOMFILTER_DEFAULT_FALSEPOSITIVE	0.01
 
 /*
  * CStoreValidOption keeps an option name and a context. When an option is passed
@@ -86,7 +89,7 @@ typedef struct CStoreValidOption
 
 
 /* Array of options that are valid for cstore_fdw */
-static const uint32 ValidOptionCount = 5;
+static const uint32 ValidOptionCount = 6;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
@@ -94,7 +97,8 @@ static const CStoreValidOption ValidOptionArray[] =
 	{ OPTION_NAME_COMPRESSION_TYPE, ForeignTableRelationId },
 	{ OPTION_NAME_COMPRESSION_LEVEL, ForeignTableRelationId },
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
-	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId }
+	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId },
+	{ OPTION_NAME_BLOOMFILTER, AttributeRelationId }
 };
 
 
@@ -150,6 +154,11 @@ typedef struct TableFooter
 
 } TableFooter;
 
+typedef struct BloomFilter {
+	int         numBits;
+	int         numHashFunctions;
+	uint64_t*   bitSet;
+} BloomFilter;
 
 /* ColumnBlockSkipNode contains statistics for a ColumnBlockData. */
 typedef struct ColumnBlockSkipNode
@@ -172,8 +181,38 @@ typedef struct ColumnBlockSkipNode
 
 	CompressionType valueCompressionType;
 
+	/* Bloom filter */
+	BloomFilter bloomFilter;
+
 } ColumnBlockSkipNode;
 
+
+/* Enumaration for cstore file's compression method */
+typedef enum
+{
+	BCCACHE_INVALID = 0,
+	BCCACHE_VALID = 1,
+	BCCACHE_HASNOCOMPARATOR = 2
+} BaseConstraintCacheElementState;
+
+typedef struct ColumnInfoCacheElement {
+	/* cache constructed minMax baseconstraint */
+	BaseConstraintCacheElementState minMaxState;
+	Node* minMaxBaseConstraint;
+
+	/* cached result of GetOperatorByType(column->vartype, BTREE_AM_OID, BTEqualStrategyNumber) */
+	Oid EqualOperator;
+
+} ColumnInfoCacheElement;
+
+typedef struct ColumnInfoCache {
+	/* This memory context should be used when elements are allocated in this cache */
+	MemoryContext cacheMemoryContext;
+
+	/* List of cache elements, one per column */
+	ColumnInfoCacheElement *elements;
+
+} ColumnInfoCache;
 
 /*
  * StripeSkipList can be used for skipping row blocks. It contains a column block
@@ -185,7 +224,6 @@ typedef struct StripeSkipList
 	ColumnBlockSkipNode **blockSkipNodeArray;
 	uint32 columnCount;
 	uint32 blockCount;
-
 } StripeSkipList;
 
 
@@ -274,13 +312,14 @@ typedef struct TableReadState
 	List *projectedColumnList;
 
 	List *whereClauseList;
-	List *whereClauseVars;
 	MemoryContext stripeReadContext;
 	StripeBuffers *stripeBuffers;
 	uint32 readStripeCount;
 	uint64 stripeReadRowCount;
 	ColumnBlockData **blockDataArray;
 	int32 deserializedBlockIndex;
+
+	ColumnInfoCache columnInfoCache;
 
 } TableReadState;
 
@@ -310,6 +349,7 @@ typedef struct TableWriteState
 	 * deallocated when memory context is reset.
 	 */
 	StringInfo compressionBuffer;
+	Oid foreignTableId;
 
 } TableWriteState;
 
@@ -334,7 +374,8 @@ extern TableWriteState * CStoreBeginWrite(const char *filename,
 										  int32 compressionLevel,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
-										  TupleDesc tupleDescriptor);
+										  TupleDesc tupleDescriptor,
+										  Oid foreignTableId);
 extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 						   bool *columnNulls);
 extern void CStoreEndWrite(TableWriteState * state);
@@ -360,5 +401,13 @@ extern CompressionType CompressBuffer(StringInfo inputBuffer, StringInfo outputB
 						   CompressionType compressionType, int compressionLevel);
 extern StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType);
 
+/* Function declarations for bloom filters */
+extern uint64 DatumHash64(Datum columnValue, bool columnTypeByValue,
+						  int columnTypeLength);
+extern void BloomFilter_init(BloomFilter* bloomFilter, int numBits, int numHashFunctions);
+extern void BloomFilter_autoSize(BloomFilter *bloomFilter, int uniquevalues, float falsepositiverate);
+extern void BloomFilter_addHash(BloomFilter *bloomFilter, uint64 hash);
+extern bool BloomFilter_testHash(BloomFilter* bloomFilter, uint64 hash);
+extern bool CStoreParseBloomfilterOption(const char *optionValue, int *uniquevalues, float *falsepositiverate);
 
-#endif   /* CSTORE_FDW_H */ 
+#endif   /* CSTORE_FDW_H */

@@ -8,7 +8,7 @@ MODULE_big = cstore_fdw
 PG_CPPFLAGS = --std=c99
 SHLIB_LINK = -lprotobuf-c
 OBJS = cstore.pb-c.o cstore_fdw.o cstore_writer.o cstore_reader.o \
-       cstore_metadata_serialization.o cstore_compression.o
+       cstore_metadata_serialization.o cstore_compression.o murmur3.o cstore_bloomfilter.o
 
 EXTENSION = cstore_fdw
 DATA = cstore_fdw--1.7.sql cstore_fdw--1.6--1.7.sql  cstore_fdw--1.5--1.6.sql cstore_fdw--1.4--1.5.sql \

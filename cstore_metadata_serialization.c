@@ -202,6 +202,19 @@ SerializeColumnSkipList(ColumnBlockSkipNode *blockSkipNodeArray, uint32 blockCou
 		protobufBlockSkipNode->has_valuecompressiontype = true;
 		protobufBlockSkipNode->valuecompressiontype =
 			(Protobuf__CompressionType) blockSkipNode.valueCompressionType;
+		if (blockSkipNode.bloomFilter.numBits > 0)
+		{
+			protobufBlockSkipNode->bloomfilter = palloc0(sizeof(Protobuf__BloomFilter));
+			protobuf__bloom_filter__init(protobufBlockSkipNode->bloomfilter);
+
+			if (blockSkipNode.bloomFilter.numHashFunctions!=1) {
+				protobufBlockSkipNode->bloomfilter->has_numhashfunctions = true;
+				protobufBlockSkipNode->bloomfilter->numhashfunctions = blockSkipNode.bloomFilter.numHashFunctions;
+			}
+
+			protobufBlockSkipNode->bloomfilter->bitset.len = blockSkipNode.bloomFilter.numBits/8;
+			protobufBlockSkipNode->bloomfilter->bitset.data = (uint8_t *)blockSkipNode.bloomFilter.bitSet;
+		}
 
 		protobufBlockSkipNodeArray[blockIndex] = protobufBlockSkipNode;
 	}
@@ -476,8 +489,9 @@ DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
 	for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
 	{
 		Protobuf__ColumnBlockSkipNode *protobufBlockSkipNode = NULL;
-		ColumnBlockSkipNode *blockSkipNode = NULL;
+		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		bool hasMinMax = false;
+        bool hasBloomFilter = false;
 		Datum minimumValue = 0;
 		Datum maximumValue = 0;
 
@@ -510,7 +524,19 @@ DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
 												 typeByValue, typeLength);
 		}
 
-		blockSkipNode = &blockSkipNodeArray[blockIndex];
+		hasBloomFilter = protobufBlockSkipNode->bloomfilter != NULL;
+		if (hasBloomFilter)
+		{
+			blockSkipNode->bloomFilter.numBits = 8 * protobufBlockSkipNode->bloomfilter->bitset.len;
+			if (protobufBlockSkipNode->bloomfilter->has_numhashfunctions)
+				blockSkipNode->bloomFilter.numHashFunctions = protobufBlockSkipNode->bloomfilter->numhashfunctions;
+			else
+				blockSkipNode->bloomFilter.numHashFunctions = 1;
+            blockSkipNode->bloomFilter.bitSet = palloc0(protobufBlockSkipNode->bloomfilter->bitset.len);
+			memcpy(blockSkipNode->bloomFilter.bitSet, protobufBlockSkipNode->bloomfilter->bitset.data,
+					protobufBlockSkipNode->bloomfilter->bitset.len);
+		}
+
 		blockSkipNode->rowCount = protobufBlockSkipNode->rowcount;
 		blockSkipNode->hasMinMax = hasMinMax;
 		blockSkipNode->minimumValue = minimumValue;

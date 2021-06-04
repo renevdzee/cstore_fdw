@@ -33,7 +33,8 @@
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-
+#include "foreign/foreign.h"
+#include "utils/builtins.h"
 
 static void CStoreWriteFooter(StringInfo footerFileName, TableFooter *tableFooter);
 static StripeBuffers * CreateEmptyStripeBuffers(uint32 stripeMaxRowCount,
@@ -41,7 +42,8 @@ static StripeBuffers * CreateEmptyStripeBuffers(uint32 stripeMaxRowCount,
 												uint32 columnCount);
 static StripeSkipList * CreateEmptyStripeSkipList(uint32 stripeMaxRowCount,
 												  uint32 blockRowCount,
-												  uint32 columnCount);
+												  uint32 columnCount,
+												  Oid foreignTableId);
 static StripeMetadata FlushStripe(TableWriteState *writeState);
 static StringInfo * CreateSkipListBufferArray(StripeSkipList *stripeSkipList,
 											  TupleDesc tupleDescriptor);
@@ -76,7 +78,7 @@ TableWriteState *
 CStoreBeginWrite(const char *filename, CompressionType compressionType,
 				 int32 compressionLevel,
 				 uint64 stripeMaxRowCount, uint32 blockRowCount,
-				 TupleDesc tupleDescriptor)
+				 TupleDesc tupleDescriptor, Oid foreignTableId)
 {
 	TableWriteState *writeState = NULL;
 	FILE *tableFile = NULL;
@@ -196,6 +198,7 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 	writeState->stripeWriteContext = stripeWriteContext;
 	writeState->blockDataArray = blockData;
 	writeState->compressionBuffer = NULL;
+	writeState->foreignTableId = foreignTableId;
 
 	return writeState;
 }
@@ -228,7 +231,8 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 		stripeBuffers = CreateEmptyStripeBuffers(writeState->stripeMaxRowCount,
 												 blockRowCount, columnCount);
 		stripeSkipList = CreateEmptyStripeSkipList(writeState->stripeMaxRowCount,
-												   blockRowCount, columnCount);
+												   blockRowCount, columnCount,
+												   writeState->foreignTableId);
 		writeState->stripeBuffers = stripeBuffers;
 		writeState->stripeSkipList = stripeSkipList;
 		writeState->compressionBuffer = makeStringInfo();
@@ -242,6 +246,7 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 			ColumnBlockData *blockData = blockDataArray[columnIndex];
 			blockData->valueBuffer = makeStringInfo();
 		}
+
 	}
 
 	blockIndex = stripeBuffers->rowCount / blockRowCount;
@@ -277,6 +282,13 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 			UpdateBlockSkipNodeMinMax(blockSkipNode, columnValues[columnIndex],
 									  columnTypeByValue, columnTypeLength,
 									  columnCollation, comparisonFunction);
+
+			if (blockSkipNode->bloomFilter.numBits > 0)
+			{
+				uint64 hash64 = DatumHash64(columnValues[columnIndex],
+									  	   columnTypeByValue, columnTypeLength);
+				BloomFilter_addHash(&blockSkipNode->bloomFilter, hash64);
+			}
 		}
 
 		blockSkipNode->rowCount++;
@@ -463,7 +475,7 @@ CreateEmptyStripeBuffers(uint32 stripeMaxRowCount, uint32 blockRowCount,
  */
 static StripeSkipList *
 CreateEmptyStripeSkipList(uint32 stripeMaxRowCount, uint32 blockRowCount,
-						  uint32 columnCount)
+						  uint32 columnCount, Oid foreignTableId)
 {
 	StripeSkipList *stripeSkipList = NULL;
 	uint32 columnIndex = 0;
@@ -473,8 +485,38 @@ CreateEmptyStripeSkipList(uint32 stripeMaxRowCount, uint32 blockRowCount,
 		palloc0(columnCount * sizeof(ColumnBlockSkipNode *));
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
 	{
+		int blockIndex;
+		List* columnOptions;
+
 		blockSkipNodeArray[columnIndex] =
 			palloc0(maxBlockCount * sizeof(ColumnBlockSkipNode));
+
+		/* Allocate and initialize Bloom filter option */
+		columnOptions = GetForeignColumnOptions(foreignTableId, columnIndex+1);
+		if (columnOptions)
+		{
+			ListCell *lc;
+			foreach(lc, columnOptions)
+			{
+				DefElem *def = (DefElem *) lfirst(lc);
+				if (strcmp(def->defname, OPTION_NAME_BLOOMFILTER) == 0 )
+				{
+					int n;
+					float f = BLOOMFILTER_DEFAULT_FALSEPOSITIVE;
+					char* optionValue = defGetString(def);
+
+					CStoreParseBloomfilterOption(optionValue, &n, &f);
+
+					if (n <= 0) continue;
+
+					for (blockIndex = 0; blockIndex < maxBlockCount; blockIndex++)
+					{
+						ColumnBlockSkipNode *skipNode = & blockSkipNodeArray[columnIndex][blockIndex];
+						BloomFilter_autoSize(&skipNode->bloomFilter, n, f);
+					}
+				}
+			}
+		}
 	}
 
 	stripeSkipList = palloc0(sizeof(StripeSkipList));

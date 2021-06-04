@@ -10,6 +10,11 @@ enum CompressionType {
   ZSTD = 3;
 };
 
+message BloomFilter {
+  required bytes  bitSet = 1;
+  optional uint32 numHashFunctions = 2;
+}
+
 message ColumnBlockSkipNode {
   optional uint64 rowCount = 1;
   optional bytes minimumValue = 2;
@@ -19,6 +24,7 @@ message ColumnBlockSkipNode {
   optional CompressionType valueCompressionType = 6;
   optional uint64 existsBlockOffset = 7;
   optional uint64 existsLength = 8;
+  optional BloomFilter bloomFilter = 9;
 }
 
 message ColumnBlockSkipList {

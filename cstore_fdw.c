@@ -132,6 +132,7 @@ static void ValidateForeignTableOptions(char *filename,
 										char *compressionTypeString, char* compressionLevelString,
 										char *stripeRowCountString,
 										char *blockRowCountString);
+static void ValidateForeignTableColumnOptions(char *bloomFilter);
 static char * CStoreDefaultFilePath(Oid foreignTableId);
 static CompressionType ParseCompressionType(const char *compressionTypeString);
 static void CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
@@ -517,7 +518,7 @@ CheckSuperuserPrivilegesForCopy(const CopyStmt* copyStatement)
 /*
  * CStoreProcessCopyCommand handles COPY <cstore_table> FROM/TO ... statements.
  * It determines the copy direction and forwards execution to appropriate function.
- * 
+ *
  * It returns number of rows processed.
  */
 static uint64
@@ -618,7 +619,8 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 								  cstoreFdwOptions->compressionLevel,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
-								  tupleDescriptor);
+								  tupleDescriptor,
+								  relationId);
 
 	while (nextRowFound)
 	{
@@ -954,7 +956,7 @@ static void InitializeCStoreTableFile(Oid relationId, Relation relation)
 	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
 			cstoreFdwOptions->compressionType, cstoreFdwOptions->compressionLevel,
 			cstoreFdwOptions->stripeRowCount,
-			cstoreFdwOptions->blockRowCount, tupleDescriptor);
+			cstoreFdwOptions->blockRowCount, tupleDescriptor, relationId);
 	CStoreEndWrite(writeState);
 }
 
@@ -1293,6 +1295,7 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 	char *compressionLevelString = NULL;
 	char *stripeRowCountString = NULL;
 	char *blockRowCountString = NULL;
+	char *bloomFilter = NULL;
 
 	foreach(optionCell, optionList)
 	{
@@ -1344,12 +1347,20 @@ cstore_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			blockRowCountString = defGetString(optionDef);
 		}
+		else if (strncmp(optionName, OPTION_NAME_BLOOMFILTER, NAMEDATALEN) == 0)
+		{
+			bloomFilter = defGetString(optionDef);
+		}
 	}
 
 	if (optionContextId == ForeignTableRelationId)
 	{
 		ValidateForeignTableOptions(filename, compressionTypeString, compressionLevelString,
 									stripeRowCountString, blockRowCountString);
+	}
+	else if (optionContextId == AttributeRelationId)
+	{
+		ValidateForeignTableColumnOptions(bloomFilter);
 	}
 
 	PG_RETURN_VOID();
@@ -1609,6 +1620,41 @@ ValidateForeignTableOptions(char *filename, char *compressionTypeString, char *c
 	}
 }
 
+/*
+ * ValidateForeignTableColumnOptions verifies if given options are valid cstore_fdw
+ * foreign column options. This function errors out if given option value is
+ * considered invalid.
+ */
+static void
+ValidateForeignTableColumnOptions(char *bloomFilter)
+{
+
+	if (bloomFilter != NULL)
+	{
+		/* pg_atoi() errors out if the given string is not a valid 32-bit integer */
+		int n;
+		float f;
+
+		if (!CStoreParseBloomfilterOption(bloomFilter, &n, &f))
+		{
+			ereport(ERROR, (errmsg("invalid value for bloomfilter"),
+							errhint("uniquevalues[,false-positive-rate]")));
+		}
+
+		if (n <= 0)
+		{
+			ereport(ERROR, (errmsg("invalid value for bloomfilter"),
+							errhint("The value must be the estimated maximum number of unique values in a block and greater than 0")));
+		}
+
+		if (f<=0.0f || f>=1.0f)
+		{
+			ereport(ERROR, (errmsg("invalid value for bloomfilter"),
+							errhint("The false-positive rate should be: 0.0 < value < 1.0")));
+		}
+	}
+
+}
 
 /*
  * CStoreDefaultFilePath constructs the default file path to use for a cstore_fdw
@@ -2401,7 +2447,7 @@ CStoreBeginForeignInsert(ModifyTableState *modifyTableState, ResultRelInfo *rela
 								  cstoreFdwOptions->compressionLevel,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
-								  tupleDescriptor);
+								  tupleDescriptor, foreignTableOid);
 
 	writeState->relation = relation;
 	relationInfo->ri_FdwState = (void *) writeState;

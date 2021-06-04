@@ -45,7 +45,8 @@ static StripeBuffers * LoadFilteredStripeBuffers(FILE *tableFile,
 												 TupleDesc tupleDescriptor,
 												 List *projectedColumnList,
 												 List *whereClauseList,
-												 List *whereClauseVars);
+												 ColumnInfoCache *columnInfoCache
+												 );
 static void ReadStripeNextRow(StripeBuffers *stripeBuffers, List *projectedColumnList,
 							  uint64 blockIndex, uint64 blockRowIndex,
 							  ColumnBlockData **blockDataArray,
@@ -63,9 +64,9 @@ static StripeSkipList * LoadStripeSkipList(FILE *tableFile,
 										   uint32 columnCount,
 										   bool *projectedColumnMask,
 										   TupleDesc tupleDescriptor);
-static bool * SelectedBlockMask(StripeSkipList *stripeSkipList,
-								List *projectedColumnList, List *whereClauseList);
-static List * BuildRestrictInfoList(List *whereClauseList);
+static bool * SelectedBlockMask(StripeSkipList *stripeSkipList, List *whereClauseList,
+								ColumnInfoCache *columnInfoCache);
+/* static List * BuildRestrictInfoList(List *whereClauseList); */
 static Node * BuildBaseConstraint(Var *variable);
 static OpExpr * MakeOpExpression(Var *variable, int16 strategyNumber);
 static Oid GetOperatorByType(Oid typeId, Oid accessMethodId, int16 strategyNumber);
@@ -92,61 +93,6 @@ static void ResetUncompressedBlockData(ColumnBlockData **blockDataArray,
 									   uint32 columnCount);
 static uint64 StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata);
 
-
-/*
- * GetClauseVars extracts the Vars from the given clauses for the purpose of
- * building constraints that can be refuted by predicate_refuted_by(). It also
- * deduplicates and sorts them.
- */
-static List *
-GetClauseVars(List *whereClauseList, int natts)
-{
-	/*
-	 * We don't recurse into or include aggregates, window functions, or
-	 * PHVs. We don't expect any PHVs during execution; and Vars found inside
-	 * an aggregate or window function aren't going to be useful in forming
-	 * constraints that can be refuted.
-	 */
-	int flags = 0;
-	List *vars = pull_var_clause((Node *) whereClauseList, flags);
-	Var **deduplicate = palloc0(sizeof(Var *) * natts);
-	List *whereClauseVars;
-
-	ListCell *lc;
-	foreach(lc, vars)
-	{
-		Node *node = lfirst(lc);
-		Var *var;
-		int idx;
-
-		Assert(IsA(node, Var));
-
-		var = (Var *) node;
-		idx = var->varattno - 1;
-
-		if (deduplicate[idx] != NULL)
-		{
-			/* if they have the same varattno, the rest should be identical */
-			Assert(equal(var, deduplicate[idx]));
-		}
-
-		deduplicate[idx] = var;
-	}
-
-	whereClauseVars = NIL;
-	for (int i = 0; i < natts; i++)
-	{
-		Var *var = deduplicate[i];
-		if (var != NULL)
-		{
-			whereClauseVars = lappend(whereClauseVars, var);
-		}
-	}
-
-	pfree(deduplicate);
-
-	return whereClauseVars;
-}
 
 /*
  * CStoreBeginRead initializes a cstore read operation. This function returns a
@@ -199,7 +145,6 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	readState->tableFooter = tableFooter;
 	readState->projectedColumnList = projectedColumnList;
 	readState->whereClauseList = whereClauseList;
-	readState->whereClauseVars = GetClauseVars(whereClauseList, columnCount);
 	readState->stripeBuffers = NULL;
 	readState->readStripeCount = 0;
 	readState->stripeReadRowCount = 0;
@@ -207,6 +152,11 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	readState->stripeReadContext = stripeReadContext;
 	readState->blockDataArray = blockDataArray;
 	readState->deserializedBlockIndex = -1;
+
+	readState->columnInfoCache.cacheMemoryContext = AllocSetContextCreate(CurrentMemoryContext,
+											  "Column Info Cache Context",
+											  ALLOCSET_DEFAULT_SIZES);
+	readState->columnInfoCache.elements = palloc0(columnCount * sizeof(ColumnInfoCacheElement));
 
 	return readState;
 }
@@ -322,7 +272,7 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 												  readState->tupleDescriptor,
 												  readState->projectedColumnList,
 												  readState->whereClauseList,
-												  readState->whereClauseVars);
+												  &readState->columnInfoCache);
 		readState->readStripeCount++;
 
 		MemoryContextSwitchTo(oldContext);
@@ -398,6 +348,8 @@ CStoreEndRead(TableReadState *readState)
 	list_free_deep(readState->tableFooter->stripeMetadataList);
 	FreeColumnBlockDataArray(readState->blockDataArray, columnCount);
 	pfree(readState->tableFooter);
+	MemoryContextDelete(readState->columnInfoCache.cacheMemoryContext);
+	pfree(readState->columnInfoCache.elements);
 	pfree(readState);
 }
 
@@ -528,7 +480,7 @@ StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata)
 static StripeBuffers *
 LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
-						  List *whereClauseList, List *whereClauseVars)
+						  List *whereClauseList, ColumnInfoCache *columnInfoCache)
 {
 	StripeBuffers *stripeBuffers = NULL;
 	ColumnBuffers **columnBuffersArray = NULL;
@@ -545,8 +497,7 @@ LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 														projectedColumnMask,
 														tupleDescriptor);
 
-	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, whereClauseVars,
-												whereClauseList);
+	bool *selectedBlockMask = SelectedBlockMask(stripeSkipList, whereClauseList, columnInfoCache);
 
 	StripeSkipList *selectedBlockSkipList =
 		SelectedBlockSkipList(stripeSkipList, projectedColumnMask,
@@ -793,77 +744,300 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
 	return stripeSkipList;
 }
 
+static bool
+predicate_refuted_by_bloomfilter(Node *node, Var *column, Const *constValue,
+								 ColumnBlockSkipNode *blockSkipNode,
+								 ColumnInfoCacheElement *columnCache)
+{
+	if (blockSkipNode->bloomFilter.numBits == 0)
+		return false;
+
+	if (columnCache->EqualOperator == InvalidOid)
+		columnCache->EqualOperator =
+			GetOperatorByType(column->vartype, BTREE_AM_OID, BTEqualStrategyNumber);
+
+	if (((OpExpr *) node)->opno != columnCache->EqualOperator)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+		{
+			uint64 hash64 =
+				DatumHash64(constValue->constvalue, constValue->constbyval, constValue->constlen);
+			/* if not in hash table it is not in this block, return true */
+			return (!BloomFilter_testHash(&blockSkipNode->bloomFilter, hash64));
+		}
+
+		case T_ScalarArrayOpExpr:
+		{
+			ScalarArrayOpExpr *op = (ScalarArrayOpExpr *) node;
+
+			if (op->useOr)
+			{
+				/* ::ANY */
+				uint64 hash64;
+
+				if (IsA(constValue, Const))
+				{
+					ArrayType *array;
+					ArrayIterator array_iterator;
+					bool predicate_refuted = true;
+					Datum value;
+					bool isnull;
+					int16 typlen;
+					bool typbyval;
+					char typalign;
+
+					/* Assuming constValue->consttype = *ARRAYOID (f.e INT4ARRAYOID), pointer to ArrayType */
+					array = (ArrayType *) DatumGetPointer(constValue->constvalue);
+
+					/* get array element type data */
+					get_typlenbyvalalign(ARR_ELEMTYPE(array), &typlen, &typbyval, &typalign);
+
+					array_iterator = array_create_iterator(array, 0, NULL);
+					while (array_iterate(array_iterator, &value, &isnull))
+					{
+						if (isnull)
+						{
+							/* ignoring NULLs should be correct ? TODO:check */
+							continue;
+						}
+						hash64 = DatumHash64(value, typbyval, typlen);
+						if (BloomFilter_testHash(&blockSkipNode->bloomFilter, hash64))
+						{
+							/* might be in this block */
+							predicate_refuted = false;
+							break;
+						}
+					}
+					array_free_iterator(array_iterator);
+
+					/* definitely not in this block */
+					return predicate_refuted;
+				}
+				else if (IsA(constValue, Param))
+				{
+					ereport(WARNING, (errmsg("CStore: Not implemented =ANY(x) where x is a Param")));
+				}
+				else
+				{
+					ereport(WARNING, (errmsg("CStore: Not implemented =ANY(x) where x is nodeTag %d", nodeTag(constValue))));
+				}
+			}
+			/* no advantages to implement ::ALL */
+			break;
+		}
+
+		default:
+			return false;
+	}
+	return false;
+}
+
+/* This tree walker walks through the tree of where clauses.
+   It tests all the predicates against the blocks' statistics from the stripeSkipList
+   to see if it can be refuted. It will check against the Minimum/Maximum value
+   and an optional bloomfilter.
+
+   This function returns true if the predicate can be refuted.
+*/
+
+typedef struct prbcs_walker_context
+{
+	uint32 blockIndex;
+	StripeSkipList *stripeSkipList;
+	ColumnInfoCache *columnInfoCache;
+} prbcs_walker_context;
+
+static bool
+predicate_refuted_by_columnstats_walker(Node *node, const prbcs_walker_context *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, RestrictInfo))
+	{
+		node = (Node *) ((RestrictInfo *) node)->clause;
+	}
+
+	switch (nodeTag(node))
+	{
+		case T_List: /* AND of list elements (RestrictInfo list) */
+		{
+			ListCell *lc;
+			foreach (lc, (List *) node)
+			{
+				if (predicate_refuted_by_columnstats_walker(lfirst(lc), context))
+					return true;
+			}
+			return false;
+		}
+		case T_OpExpr:			  /* attribute OP const */
+		case T_ScalarArrayOpExpr: /* attribute in const-list */
+		{
+			Var *column = NULL;
+			Const *constValue = NULL;
+			if (IsA(node, ScalarArrayOpExpr))
+			{
+				ScalarArrayOpExpr *op = (ScalarArrayOpExpr *) node;
+				column = (Var *) linitial(op->args);
+				Assert(IsA(lsecond(op->args), Const));
+				constValue = (Const *) lsecond(op->args);
+			}
+			else if IsA (node, OpExpr)
+			{
+				Node *argl = linitial(((OpExpr *) node)->args);
+				Node *argr = lsecond(((OpExpr *) node)->args);
+
+				if (IsA(argl, Var) && IsA(argr, Const))
+				{
+					column = (Var *) argl;
+					constValue = (Const *) argr;
+				}
+				else if (IsA(argl, Const) && IsA(argr, Var))
+				{
+					column = (Var *) argr;
+					constValue = (Const *) argl;
+				}
+				else
+					return false;
+			}
+
+			if (column)
+			{
+				uint32 columnIndex = column->varattno - 1;
+				Node *baseConstraint = NULL;
+				ColumnBlockSkipNode *blockSkipNodeArray =
+					context->stripeSkipList->blockSkipNodeArray[columnIndex];
+				ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[context->blockIndex];
+				ColumnInfoCacheElement *columnCache =
+					&context->columnInfoCache->elements[columnIndex];
+
+				/* Try to refute "=" or "IN" predicates with the bloomfilter */
+				if (predicate_refuted_by_bloomfilter(node,
+													 column,
+													 constValue,
+													 blockSkipNode,
+													 columnCache))
+				{
+					return true;
+				}
+
+				/*
+				 * A column block with comparable data type can miss min/max values
+				 * if all values in the block are NULL.
+				 */
+				if (!blockSkipNode->hasMinMax)
+				{
+					return false;
+				}
+
+				/* if this column's data type doesn't have a comparator, skip it */
+				if (columnCache->minMaxState == BCCACHE_HASNOCOMPARATOR)
+				{
+					return false;
+				}
+
+				/* Check if the min/max baseConstraint for this column is in the cache */
+				if (columnCache->minMaxState == BCCACHE_VALID)
+				{
+					baseConstraint = columnCache->minMaxBaseConstraint;
+				}
+				else /* Create a new constraint and add to cache */
+				{
+					FmgrInfo *comparisonFunction =
+						GetFunctionInfoOrNull(column->vartype, BTREE_AM_OID, BTORDER_PROC);
+					if (comparisonFunction == NULL)
+					{
+						columnCache->minMaxState = BCCACHE_HASNOCOMPARATOR;
+						return false;
+					}
+					else
+					{
+						MemoryContext oldContext =
+							MemoryContextSwitchTo(context->columnInfoCache->cacheMemoryContext);
+						baseConstraint = BuildBaseConstraint(column);
+						MemoryContextSwitchTo(oldContext);
+						columnCache->minMaxBaseConstraint = baseConstraint;
+						columnCache->minMaxState = BCCACHE_VALID;
+					}
+				}
+
+				UpdateConstraint(baseConstraint,
+								 blockSkipNode->minimumValue,
+								 blockSkipNode->maximumValue);
+#if (PG_VERSION_NUM >= 100000)
+				return predicate_refuted_by(list_make1(baseConstraint), list_make1(node), false);
+#else
+				return predicate_refuted_by(list_make1(baseConstraint), list_make1(node));
+#endif
+			}
+			break;
+		}
+
+		/* Recurse for AND and OR expressions */
+		case T_BoolExpr:
+		{
+			BoolExpr *boolExpr = (BoolExpr *) node;
+			if (is_andclause(node))
+			{
+				// any true -> return true
+				ListCell *lc;
+				foreach (lc, boolExpr->args)
+				{
+					if (predicate_refuted_by_columnstats_walker(lfirst(lc), context))
+						return true;
+				}
+				return false;
+			} 
+			else if (is_orclause(node))
+			{
+				// any false -> return false
+				ListCell *lc;
+				foreach (lc, boolExpr->args)
+				{
+					if (!predicate_refuted_by_columnstats_walker(lfirst(lc), context))
+						return false;
+				}
+				return true;
+			}
+			/* NOT_EXPR / is_notclause -> fail refute */
+			return false;
+		}
+
+		default:
+			/* all other node types we cannot refute */
+			return false;
+	}
+
+	return false;
+}
 
 /*
- * SelectedBlockMask walks over each column's blocks and checks if a block can
+ * SelectedBlockMask checks for each block if a block can
  * be filtered without reading its data. The filtering happens when all rows in
  * the block can be refuted by the given qualifier conditions.
  */
 static bool *
-SelectedBlockMask(StripeSkipList *stripeSkipList, List *whereClauseVars,
-				  List *whereClauseList)
+SelectedBlockMask(StripeSkipList *stripeSkipList, List *whereClauseList,
+				  ColumnInfoCache *columnInfoCache)
 {
-	bool *selectedBlockMask = NULL;
-	ListCell *columnCell = NULL;
-	uint32 blockIndex = 0;
-	List *restrictInfoList = BuildRestrictInfoList(whereClauseList);
+	prbcs_walker_context ctx;
+	bool *selectedBlockMask = palloc(stripeSkipList->blockCount * sizeof(bool));
 
-	selectedBlockMask = palloc0(stripeSkipList->blockCount * sizeof(bool));
-	memset(selectedBlockMask, true, stripeSkipList->blockCount * sizeof(bool));
-
-	for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
+	ctx.stripeSkipList = stripeSkipList;
+	ctx.columnInfoCache = columnInfoCache;
+	for (ctx.blockIndex = 0; ctx.blockIndex < stripeSkipList->blockCount; ctx.blockIndex++)
 	{
-		bool predicateRefuted = false;
-		List *constraintList = NIL;
-
-		foreach(columnCell, whereClauseVars)
-		{
-			Var *column = lfirst(columnCell);
-			uint32 columnIndex = column->varattno - 1;
-			FmgrInfo *comparisonFunction = NULL;
-			Node *baseConstraint = NULL;
-			ColumnBlockSkipNode *blockSkipNodeArray =
-				stripeSkipList->blockSkipNodeArray[columnIndex];
-			ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
-
-			/* if this column's data type doesn't have a comparator, skip it */
-			comparisonFunction = GetFunctionInfoOrNull(column->vartype, BTREE_AM_OID,
-													BTORDER_PROC);
-			if (comparisonFunction == NULL)
-			{
-				continue;
-			}
-
-			/*
-			 * A column block with comparable data type can miss min/max values
-			 * if all values in the block are NULL.
-			 */
-			if (!blockSkipNode->hasMinMax)
-			{
-				continue;
-			}
-
-			baseConstraint = BuildBaseConstraint(column);
-			UpdateConstraint(baseConstraint, blockSkipNode->minimumValue,
-								blockSkipNode->maximumValue);
-
-			constraintList = lappend(constraintList, baseConstraint);
-		}
-
-#if (PG_VERSION_NUM >= 100000)
-		predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList, false);
-#else
-		predicateRefuted = predicate_refuted_by(constraintList, restrictInfoList);
-#endif
-		if (predicateRefuted)
-		{
-			selectedBlockMask[blockIndex] = false;
-		}
+		selectedBlockMask[ctx.blockIndex] =
+			!predicate_refuted_by_columnstats_walker((Node *) whereClauseList, &ctx);
 	}
 
 	return selectedBlockMask;
 }
-
 
 /*
  * GetFunctionInfoOrNull first resolves the operator for the given data type,
@@ -910,6 +1084,7 @@ GetFunctionInfoOrNull(Oid typeId, Oid accessMethodId, int16 procedureId)
  * and then return this list. The function is copied from CitusDB's shard pruning
  * logic.
  */
+/*
 static List *
 BuildRestrictInfoList(List *whereClauseList)
 {
@@ -927,7 +1102,7 @@ BuildRestrictInfoList(List *whereClauseList)
 
 	return restrictInfoList;
 }
-
+*/
 
 /*
  * BuildBaseConstraint builds and returns a base constraint. This constraint
@@ -1439,3 +1614,4 @@ ResetUncompressedBlockData(ColumnBlockData **blockDataArray, uint32 columnCount)
 		}
 	}
 }
+

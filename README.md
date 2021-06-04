@@ -1,3 +1,12 @@
+cstore_fdw with additional features (experimental)
+==================================================
+
+This fork adds the following features:
+* Additional compression algorithms (lz4, lz4hc and zstd)
+* Bloom filters
+
+Use at your own risk, do not use to store important data than cannot be re-created!
+
 cstore_fdw
 ==========
 
@@ -24,6 +33,7 @@ upon RCFile developed at Facebook, and brings the following benefits:
   performance for I/O bound queries.
 * Skip indexes: Stores min/max statistics for row groups, and uses them to skip
   over unrelated rows.
+* Bloom filters: Fast block selection for `=` and `IN(...)` predicates.
 
 Further, we used the Postgres foreign data wrapper APIs and type representations
 with this extension. This brings:
@@ -106,6 +116,12 @@ The following parameters can be set on a cstore foreign table object.
   in fewer reads from disk. However, higher values also reduce the probability of
   skipping over unrelated row blocks.
 
+The following parameters can be set on a cstore foreign table column.
+
+* bloomfilter (optional): This option will add a Bloom filter to the column. Specify the expected number
+  of unique values in a block. Should be larger than 0 and less than block\_row\_count.
+  Optionally a desired false positive rate can be supplied by adding a comma and the ratio as
+  a number between 0.0 and 1.0. The default is ```0.01``` (1%). See below.
 
 To load or append data into a cstore table, you have two options:
 
@@ -160,7 +176,7 @@ CREATE SERVER cstore_server FOREIGN DATA WRAPPER cstore_fdw;
 -- create foreign table
 CREATE FOREIGN TABLE customer_reviews
 (
-    customer_id TEXT,
+    customer_id TEXT OPTIONS(bloomfilter '5000,0.02'),
     review_date DATE,
     review_rating INTEGER,
     review_votes INTEGER,
@@ -170,11 +186,11 @@ CREATE FOREIGN TABLE customer_reviews
     product_sales_rank BIGINT,
     product_group TEXT,
     product_category TEXT,
-    product_subcategory TEXT,
+    product_subcategory TEXT OPTIONS(bloomfilter '700'),
     similar_product_ids CHAR(10)[]
 )
 SERVER cstore_server
-OPTIONS(compression 'pglz');
+OPTIONS(compression 'lz4', compression_level '3');
 ```
 
 Next, we load data into the table:
@@ -223,6 +239,14 @@ GROUP BY
     title_length_bucket
 ORDER BY
     title_length_bucket;
+
+-- Show all reviews for the subcategories 'Exercise' and 'Bodybuilding' (will use the Bloom filter index).
+SELECT
+    customer_id, review_date, review_rating, product_id, product_title
+FROM
+    customer_reviews
+WHERE
+    product_subcategory in ('Exercise','Bodybuilding');
 ```
 
 
@@ -257,6 +281,33 @@ on which it is naturally sorted. Usually, the queries also have a filter clause 
 that column (for example you want to query only the last week's data), and hence you
 don't need to sort the data in such cases.
 
+Using Bloom filters
+-------------------
+
+with the bloomfilter option a bloomfilter-index can be created on a column. The number of bits and number of hashfunctions is calculated from the estimated number of unique values per block and the requested false postive rate.
+
+The following formula is used to calculate the size of the Bloom filter in bits:
+```
+uniquevalues*-ln(falsepositiverate)/(ln(2)*ln(2))
+```
+
+In the customer_reviews example '`5000,0.02`' creates a Bloom filter for 5000 unique values per block and a 2% false positive rate. In this case 40768 bits, or 5096 bytes per block (vs. about 140kb uncompressed customer_id data per block). An estimate for the number of unique customer_id's per block was retrieved with the following query (the highest being 4741).
+
+```sql
+select chunknumber, count(distinct customer_id)
+from (
+	select (row_number() OVER ())/10000+1 AS chunknumber, customer_id
+	from customer_reviews_hc
+) x
+group by chunknumber;
+```
+
+This bloom filter on customer_id makes the "Dune series" example above run 20 times faster.
+
+Bloom filter data is (currently) stored in the column stripe header. This is not ideal, and can slow down queries not using the Bloom filter.
+
+Adding or updating a Bloom filter on an existing column will have no effect on existing data, only on newly added data. 
+Truncate the table and reload the data to apply the new Bloomfilter settings for the existing the rows.
 
 Uninstalling cstore_fdw
 -----------------------
