@@ -4,6 +4,7 @@ cstore_fdw with additional features (experimental)
 This fork adds the following features:
 * Additional compression algorithms (lz4, lz4hc and zstd)
 * Bloom filters
+* Null statistics
 
 Use at your own risk, do not use to store important data than cannot be re-created!
 
@@ -34,6 +35,7 @@ upon RCFile developed at Facebook, and brings the following benefits:
 * Skip indexes: Stores min/max statistics for row groups, and uses them to skip
   over unrelated rows.
 * Bloom filters: Fast block selection for `=` and `IN(...)` predicates.
+* Null statistics
 
 Further, we used the Postgres foreign data wrapper APIs and type representations
 with this extension. This brings:
@@ -247,6 +249,9 @@ FROM
     customer_reviews
 WHERE
     product_subcategory in ('Exercise','Bodybuilding');
+
+-- Do we have any reviews with customer_id NULL ?
+SELECT COUNT(*) FROM customer_reviews WHERE customer_id IS NULL;
 ```
 
 
@@ -308,6 +313,21 @@ Bloom filter data is (currently) stored in the column stripe header. This is not
 
 Adding or updating a Bloom filter on an existing column will have no effect on existing data, only on newly added data. 
 Truncate the table and reload the data to apply the new Bloomfilter settings for the existing the rows.
+
+Null statistics
+---------------
+
+The number of NULL values in a column is counted for each block. This information is used for filtering on `IS (NOT) NULL` predicates. Additionaly for any comparison where the column's values in a block are NULL the block can be skipped. 
+
+f.e.
+
+```sql
+SELECT count(*) AS deleted_since_jan1
+FROM a_table 
+WHERE DeletedAt>date'2021-01-01';
+```
+will skip all blocks where `DeletedAt` IS NULL.
+
 
 Uninstalling cstore_fdw
 -----------------------

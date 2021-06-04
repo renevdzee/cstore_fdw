@@ -262,6 +262,7 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 		if (columnNulls[columnIndex])
 		{
 			blockData->existsArray[blockRowIndex] = false;
+			blockSkipNode->nullCount++;
 		}
 		else
 		{

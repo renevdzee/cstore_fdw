@@ -25,6 +25,7 @@ message ColumnBlockSkipNode {
   optional uint64 existsBlockOffset = 7;
   optional uint64 existsLength = 8;
   optional BloomFilter bloomFilter = 9;
+  optional uint64 NullCount = 10;
 }
 
 message ColumnBlockSkipList {

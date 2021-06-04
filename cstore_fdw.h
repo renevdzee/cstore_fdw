@@ -168,6 +168,7 @@ typedef struct ColumnBlockSkipNode
 	Datum minimumValue;
 	Datum maximumValue;
 	uint64 rowCount;
+	int64 nullCount;
 
 	/*
 	 * Offsets and sizes of value and exists streams in the column data.

@@ -202,6 +202,9 @@ SerializeColumnSkipList(ColumnBlockSkipNode *blockSkipNodeArray, uint32 blockCou
 		protobufBlockSkipNode->has_valuecompressiontype = true;
 		protobufBlockSkipNode->valuecompressiontype =
 			(Protobuf__CompressionType) blockSkipNode.valueCompressionType;
+		protobufBlockSkipNode->has_nullcount = (blockSkipNode.nullCount>=0);
+		protobufBlockSkipNode->nullcount = blockSkipNode.nullCount;
+
 		if (blockSkipNode.bloomFilter.numBits > 0)
 		{
 			protobufBlockSkipNode->bloomfilter = palloc0(sizeof(Protobuf__BloomFilter));
@@ -491,7 +494,7 @@ DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
 		Protobuf__ColumnBlockSkipNode *protobufBlockSkipNode = NULL;
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		bool hasMinMax = false;
-        bool hasBloomFilter = false;
+		bool hasBloomFilter = false;
 		Datum minimumValue = 0;
 		Datum maximumValue = 0;
 
@@ -547,6 +550,8 @@ DeserializeColumnSkipList(StringInfo buffer, bool typeByValue, int typeLength,
 		blockSkipNode->valueLength = protobufBlockSkipNode->valuelength;
 		blockSkipNode->valueCompressionType =
 			(CompressionType) protobufBlockSkipNode->valuecompressiontype;
+		blockSkipNode->nullCount = protobufBlockSkipNode->has_nullcount ?
+			protobufBlockSkipNode->nullcount : -1;
 	}
 
 	protobuf__column_block_skip_list__free_unpacked(protobufBlockSkipList, NULL);

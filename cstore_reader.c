@@ -837,8 +837,8 @@ predicate_refuted_by_bloomfilter(Node *node, Var *column, Const *constValue,
 
 /* This tree walker walks through the tree of where clauses.
    It tests all the predicates against the blocks' statistics from the stripeSkipList
-   to see if it can be refuted. It will check against the Minimum/Maximum value
-   and an optional bloomfilter.
+   to see if it can be refuted. It will checks against the Minimum/Maximum value, NULL-
+   statistics and an optional bloomfilter.
 
    This function returns true if the predicate can be refuted.
 */
@@ -916,6 +916,11 @@ predicate_refuted_by_columnstats_walker(Node *node, const prbcs_walker_context *
 				ColumnInfoCacheElement *columnCache =
 					&context->columnInfoCache->elements[columnIndex];
 
+				/* If the columns' values in this block are all null, any comparison
+				   will be undefined and in a where-clause context refutes the predicate */
+				if (blockSkipNode->nullCount == blockSkipNode->rowCount)
+					return true;
+
 				/* Try to refute "=" or "IN" predicates with the bloomfilter */
 				if (predicate_refuted_by_bloomfilter(node,
 													 column,
@@ -992,7 +997,7 @@ predicate_refuted_by_columnstats_walker(Node *node, const prbcs_walker_context *
 						return true;
 				}
 				return false;
-			} 
+			}
 			else if (is_orclause(node))
 			{
 				// any false -> return false
@@ -1008,6 +1013,26 @@ predicate_refuted_by_columnstats_walker(Node *node, const prbcs_walker_context *
 			return false;
 		}
 
+		/* Try to refute "column IS [NOT] NULL" predicates */
+		case T_NullTest:
+		{
+			NullTest *nt = (NullTest *) node;
+			if (IsA(nt->arg, Var))
+			{
+				Var *column = (Var *) nt->arg;
+				uint32 columnIndex = column->varattno - 1;
+				ColumnBlockSkipNode *blockSkipNodeArray =
+					context->stripeSkipList->blockSkipNodeArray[columnIndex];
+				ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[context->blockIndex];
+
+				if (nt->nulltesttype == IS_NULL && blockSkipNode->nullCount == 0)
+					return true;
+				else if (nt->nulltesttype == IS_NOT_NULL &&
+						 blockSkipNode->nullCount == blockSkipNode->rowCount)
+					return true;
+			}
+			break;
+		}
 		default:
 			/* all other node types we cannot refute */
 			return false;
